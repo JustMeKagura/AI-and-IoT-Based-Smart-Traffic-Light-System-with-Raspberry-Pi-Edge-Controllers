@@ -1,0 +1,90 @@
+# =============================================================================
+# ATCS - Adaptive Traffic Control System
+# config.yaml | Single Source of Truth for ALL system parameters
+# Both Edge (Raspberry Pi) and Server (Laptop) load from this file.
+# NEVER hardcode values in source files. Reference this file instead.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. MQTT BROKER
+# -----------------------------------------------------------------------------
+mqtt:
+  broker_host: "192.168.1.100"       # IP of the machine running Mosquitto
+  broker_port: 1883                   # Default Mosquitto port (non-TLS)
+  keepalive: 60                       # Seconds between MQTT PING packets
+  qos: 1                              # At-least-once delivery (required)
+  reconnect_delay_min: 1              # Seconds before first reconnect attempt
+  reconnect_delay_max: 30             # Seconds cap for exponential backoff
+
+# -----------------------------------------------------------------------------
+# 2. INTERSECTION
+# -----------------------------------------------------------------------------
+intersection:
+  id: "intersection_01"               # Used to build all MQTT topic strings
+                                      # Topic pattern: atcs/{id}/...
+
+# -----------------------------------------------------------------------------
+# 3. EDGE (Raspberry Pi) SETTINGS
+# -----------------------------------------------------------------------------
+edge:
+  # Camera
+  camera_index: 0                     # USB camera device index (cv2.VideoCapture)
+  frame_width: 640                    # Capture width in pixels
+  frame_height: 480                   # Capture height in pixels
+  jpeg_quality: 80                    # JPEG compression quality (0-100)
+  capture_fps: 1                      # Frames published per second (keep low!)
+
+  # Fallback / Watchdog
+  server_timeout_seconds: 30          # If no command received in this window,
+                                      # Edge switches to fixed-cycle fallback mode.
+
+  # Fixed-Cycle Fallback Timings (seconds)
+  fallback_green_duration: 30         # Green phase duration during fallback
+  fallback_amber_duration: 4          # Amber phase duration during fallback
+  fallback_red_duration: 30           # Red phase duration during fallback
+
+  # GPIO Pin assignments (BCM numbering via gpiozero)
+  gpio_pins:
+    red: 17
+    amber: 27
+    green: 22
+
+# -----------------------------------------------------------------------------
+# 4. SERVER (Laptop) SETTINGS
+# -----------------------------------------------------------------------------
+server:
+  # YOLOv8s Inference
+  model_path: "yolov8s.pt"            # Path to model weights file
+  inference_conf: 0.15                # Detection confidence threshold
+  inference_imgsz: 640                # Input image size for YOLO (square)
+  coco_vehicle_classes: [2, 3, 5, 7]  # car=2, motorcycle=3, bus=5, truck=7
+
+  # Preprocessing
+  clahe_clip_limit: 2.0               # CLAHE contrast enhancement clip limit
+  clahe_tile_grid_size: [8, 8]        # CLAHE tile grid dimensions
+
+  # Smoother (moving average to prevent flicker)
+  smoother_window_size: 3             # Number of frames to average over
+
+  # Timing Algorithm
+  min_green_duration: 10              # Minimum green phase (seconds)
+  max_green_duration: 60              # Maximum green phase (seconds)
+  amber_duration: 4                   # Fixed amber phase (seconds) — never dynamic
+  red_clearance_duration: 2           # All-red buffer between phase switches (s)
+  vehicles_per_second: 2              # Vehicles discharged per second of green
+                                      # Formula: green = clamp(count / rate,
+                                      #                        min, max)
+
+  # Latency
+  pipeline_timeout_ms: 1500           # P95 end-to-end budget (ms) — log if exceeded
+
+  # SQLite Persistence
+  db_path: "atcs_log.db"             # Path to SQLite database file
+
+# -----------------------------------------------------------------------------
+# 5. LOGGING
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"                       # DEBUG | INFO | WARNING | ERROR
+  log_to_file: false                  # Set true to also write logs to disk
+  log_file_path: "atcs.log"          # Only used if log_to_file is true

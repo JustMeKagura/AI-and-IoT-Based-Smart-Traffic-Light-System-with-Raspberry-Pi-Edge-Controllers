@@ -1,0 +1,60 @@
+# =============================================================================
+# ATCS - Adaptive Traffic Control System
+# requirements.txt | Full project dev dependencies (Laptop / Server)
+#
+# Install on the server/laptop with:
+#   pip install -r requirements.txt
+#
+# This file covers:
+#   - Server-side AI inference stack (ultralytics, opencv, numpy)
+#   - MQTT client (shared with edge, but full opencv here not headless)
+#   - Config parsing (PyYAML)
+#   - Dev tooling (pytest, black, ruff)
+#
+# DO NOT install this on the Raspberry Pi — use edge/requirements_edge.txt.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Server — AI Inference
+# -----------------------------------------------------------------------------
+
+# YOLOv8s model + inference pipeline
+ultralytics>=8.2.0
+
+# Full OpenCV (with GUI support for dev/debug visualisation)
+opencv-python>=4.9.0
+
+# Numerical arrays — YOLO output processing and CLAHE preprocessing
+numpy>=1.26.0
+
+# -----------------------------------------------------------------------------
+# Shared — MQTT & Config (both Edge and Server use these)
+# -----------------------------------------------------------------------------
+
+# MQTT client — Paho 2.x API
+paho-mqtt>=2.0.0
+
+# Config file parsing
+PyYAML>=6.0.1
+
+# -----------------------------------------------------------------------------
+# Server — Persistence
+# -----------------------------------------------------------------------------
+
+# sqlite3 is stdlib — no extra install needed
+
+# -----------------------------------------------------------------------------
+# Dev Tooling
+# -----------------------------------------------------------------------------
+
+# Test runner
+pytest>=8.0.0
+
+# Test coverage reporting
+pytest-cov>=5.0.0
+
+# Code formatter
+black>=24.0.0
+
+# Linter (replaces flake8 + isort)
+ruff>=0.4.0

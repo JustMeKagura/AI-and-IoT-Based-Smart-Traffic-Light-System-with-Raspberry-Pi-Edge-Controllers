@@ -1,0 +1,31 @@
+# =============================================================================
+# ATCS - Adaptive Traffic Control System
+# edge/requirements_edge.txt | Raspberry Pi 5 dependencies
+#
+# Install on the Pi with:
+#   pip install -r requirements_edge.txt --break-system-packages
+#
+# Rules:
+#   - NO torch, NO ultralytics, NO numpy here. Edge does NO AI inference.
+#   - opencv-python-headless only — no GUI/display dependencies on Pi OS.
+#   - paho-mqtt >= 2.0 required — API changed significantly from 1.x.
+#   - gpiozero is pre-installed on Raspberry Pi OS Bookworm but pinned
+#     here for reproducibility.
+#   - PyYAML for config.yaml parsing (shared/config_loader.py).
+# =============================================================================
+
+# MQTT client — Paho 2.x API (CallbackAPIVersion required)
+paho-mqtt>=2.0.0
+
+# Camera capture and JPEG encoding (headless = no GUI, safe on Pi)
+opencv-python-headless>=4.9.0
+
+# GPIO control via gpiozero (BCM pin numbering, clean LED abstraction)
+gpiozero>=2.0
+
+# GPIO backend for gpiozero on Raspberry Pi 5
+# RPi.GPIO is not yet Pi 5 compatible — use lgpio instead
+lgpio>=0.2.0
+
+# Config file parsing
+PyYAML>=6.0.1

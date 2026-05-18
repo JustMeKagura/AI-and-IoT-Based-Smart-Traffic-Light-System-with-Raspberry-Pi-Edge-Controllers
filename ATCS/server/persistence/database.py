@@ -2,34 +2,27 @@
 server/persistence/database.py
 ─────────────────────────────────────────────────────────────────────────────
 Responsibility : Thread-safe SQLite logger for every phase decision made by
-                 timing_algo.py. Provides query methods for PFE report graphs.
+                 timing_algo.py. Provides the raw data for PFE report graphs.
 
 Design
-    - Class-based; instantiated once by main.py at startup.
-    - threading.Lock guards every write; SQLite opened with
-      check_same_thread=False so the connection is shared safely.
-    - Schema is created/migrated on connect(); idempotent — safe to call on an
-      existing database.
-    - insert_decision() accepts a PhaseDecision + frame_index directly.
-    - insert_frame() wraps multiple lane decisions in one atomic transaction.
-    - inf raw_duration (Webster oversaturation) is stored as NULL — SQLite has
-      no IEEE 754 infinity; NULL is the correct sentinel for "unbounded".
-    - Query methods return typed DecisionRecord dataclasses, not raw tuples.
+    - Database is a class; instantiated and opened once by main.py.
+    - threading.Lock guards every write so the inference loop and any future
+      background thread can both call log_decision() safely.
+    - SQLite is opened with check_same_thread=False (lock is ours, not SQLite's).
+    - Schema is created on open() if the table does not yet exist — idempotent.
+    - db_path=':memory:' is fully supported for testing.
 
-Schema
-    decisions (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts              REAL    NOT NULL,   -- Unix timestamp (time.time())
-        frame_index     INTEGER NOT NULL,
-        lane_id         TEXT    NOT NULL,
-        vehicle_count   INTEGER NOT NULL,
-        green_duration  REAL    NOT NULL,
-        raw_duration    REAL,              -- NULL when oversaturated (inf)
-        algorithm       TEXT    NOT NULL,
-        was_clamped     INTEGER NOT NULL,  -- 0 / 1
-        clamp_reason    TEXT    NOT NULL
-    )
-    schema_version (version INTEGER PRIMARY KEY)
+Schema  (table: events)
+    id            INTEGER  PRIMARY KEY AUTOINCREMENT
+    ts            REAL     Unix timestamp (time.time())
+    lane_id       TEXT     Lane identifier
+    vehicle_count INTEGER  Smoothed count that drove this decision
+    green_duration REAL    Final clamped green duration in seconds
+    raw_duration  REAL     Pre-clamp computed duration
+    algorithm     TEXT     'webster' or 'linear'
+    was_clamped   INTEGER  0 or 1 (SQLite has no BOOLEAN)
+    clamp_reason  TEXT     'min', 'max', 'oversaturated', or ''
+    frame_index   INTEGER  Frame counter from SmoothedResult
 
 Author : Oussama (server side)
 """
@@ -49,7 +42,28 @@ from server.logic.timing_algo import PhaseDecision
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+# ──────────────────────────────────────────────────────────────────────────────
+# Schema
+# ──────────────────────────────────────────────────────────────────────────────
+
+_CREATE_TABLE = """
+CREATE TABLE IF NOT EXISTS events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL    NOT NULL,
+    lane_id        TEXT    NOT NULL,
+    vehicle_count  INTEGER NOT NULL,
+    green_duration REAL    NOT NULL,
+    raw_duration   REAL    NOT NULL,
+    algorithm      TEXT    NOT NULL,
+    was_clamped    INTEGER NOT NULL,
+    clamp_reason   TEXT    NOT NULL DEFAULT '',
+    frame_index    INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_CREATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+"""
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -57,38 +71,26 @@ SCHEMA_VERSION = 1
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DatabaseError(RuntimeError):
-    """Raised for unrecoverable database errors."""
+    """Raised for unrecoverable database failures."""
 
 
-class DatabaseNotConnectedError(DatabaseError):
-    """Raised when a DB operation is attempted before connect()."""
+class DatabaseNotOpenError(DatabaseError):
+    """Raised when a DB operation is attempted before open()."""
 
 
 @dataclass
-class DecisionRecord:
-    """A single row from the decisions table, with Python-native types."""
+class EventRecord:
+    """A single row read back from the events table."""
     id:             int
-    ts:             float       # Unix timestamp
-    frame_index:    int
+    ts:             float
     lane_id:        str
     vehicle_count:  int
     green_duration: float
-    raw_duration:   Optional[float]   # None when oversaturated
+    raw_duration:   float
     algorithm:      str
     was_clamped:    bool
     clamp_reason:   str
-
-
-@dataclass
-class LaneSummary:
-    """Aggregate statistics for one lane, used for PFE graphs."""
-    lane_id:            str
-    total_decisions:    int
-    avg_vehicle_count:  float
-    avg_green_duration: float
-    max_green_duration: float
-    min_green_duration: float
-    oversaturated_count: int   # decisions where clamp_reason == 'oversaturated'
+    frame_index:    int
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,382 +99,290 @@ class LaneSummary:
 
 class Database:
     """
-    Thread-safe SQLite logger for ATCS phase decisions.
+    Thread-safe SQLite logger for phase decisions.
 
     Usage
     -----
-        db = Database("data/atcs.db")
-        db.connect()
-        db.insert_frame(timing_result.decisions, frame_index=42)
-        records = db.query_lane("north", limit=100)
+        db = Database(db_path="atcs.db")
+        db.open()
+        db.log_decision(decision, frame_index=1)
+        records = db.fetch_recent(limit=100)
         db.close()
     """
 
-    def __init__(self, db_path: str | Path = "data/atcs.db") -> None:
+    def __init__(self, db_path: str | Path = "atcs.db") -> None:
         """
         Parameters
         ----------
         db_path : str | Path
-            Path to the SQLite file. Parent directories are created on connect().
+            Path to the SQLite file. Use ':memory:' for in-memory (tests).
+            Parent directory must already exist for file-based DBs.
         """
-        self._db_path  = Path(db_path)
+        self._db_path  = str(db_path)
         self._conn:    Optional[sqlite3.Connection] = None
-        self._lock     = threading.Lock()
-        self._connected = False
+        self._lock:    threading.Lock = threading.Lock()
+        self._is_open: bool = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def connect(self) -> None:
+    def open(self) -> None:
         """
-        Open the database, create parent directories, initialise the schema.
-
-        Safe to call on an existing database — schema creation is idempotent.
+        Open (or create) the SQLite database and ensure the schema exists.
 
         Raises
         ------
         DatabaseError
-            If the directory cannot be created or the DB file cannot be opened.
+            If the parent directory does not exist, or SQLite fails to open.
         """
-        if self._connected:
-            log.warning("Database.connect() called again — already connected, skipping.")
+        if self._is_open:
+            log.warning("Database.open() called again — already open, skipping.")
             return
 
-        try:
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise DatabaseError(
-                f"Cannot create database directory '{self._db_path.parent}': {exc}"
-            ) from exc
+        # Validate parent directory for file-based DBs
+        if self._db_path != ":memory:":
+            parent = Path(self._db_path).parent
+            if not parent.exists():
+                raise DatabaseError(
+                    f"Cannot open database: parent directory '{parent}' does not exist."
+                )
 
         try:
             self._conn = sqlite3.connect(
-                str(self._db_path),
-                check_same_thread=False,    # we guard with _lock ourselves
-                detect_types=sqlite3.PARSE_DECLTYPES,
+                self._db_path,
+                check_same_thread=False,   # we manage thread-safety with our lock
             )
-            self._conn.execute("PRAGMA journal_mode=WAL;")   # better concurrency
-            self._conn.execute("PRAGMA foreign_keys=ON;")
-            self._init_schema()
-            self._connected = True
-            log.info("Database connected: '%s'", self._db_path)
+            self._conn.row_factory = sqlite3.Row
+            with self._lock:
+                self._conn.execute(_CREATE_TABLE)
+                self._conn.execute(_CREATE_INDEX)
+                self._conn.commit()
+            self._is_open = True
+            log.info("Database opened: '%s'.", self._db_path)
 
-        except sqlite3.Error as exc:
-            raise DatabaseError(f"Failed to open database '{self._db_path}': {exc}") from exc
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(
+                f"Failed to open database '{self._db_path}': {exc}"
+            ) from exc
 
     def close(self) -> None:
-        """
-        Flush and close the database connection.
-        Safe to call even if not connected or already closed.
-        """
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except sqlite3.Error as exc:
-                log.warning("Error closing database: %s", exc)
-            finally:
-                self._conn = None
-                self._connected = False
-                log.info("Database closed.")
+        """Close the database connection. Safe to call even if not open."""
+        if not self._is_open or self._conn is None:
+            log.debug("Database.close() called but DB is not open — no-op.")
+            return
+        with self._lock:
+            self._conn.close()
+            self._conn    = None
+            self._is_open = False
+        log.info("Database closed.")
 
     @property
-    def is_connected(self) -> bool:
-        return self._connected
+    def is_open(self) -> bool:
+        return self._is_open
 
-    @property
-    def db_path(self) -> Path:
-        return self._db_path
+    # ── Write ─────────────────────────────────────────────────────────────────
 
-    # ── Writes ────────────────────────────────────────────────────────────────
-
-    def insert_decision(
+    def log_decision(
         self,
         decision:    PhaseDecision,
-        frame_index: int,
+        frame_index: int = 0,
         ts:          Optional[float] = None,
     ) -> int:
         """
-        Insert a single PhaseDecision row.
+        Insert one PhaseDecision into the events table.
 
         Parameters
         ----------
         decision    : PhaseDecision  – output of timing_algo.compute()
-        frame_index : int            – forwarded from SmoothedResult/TimingResult
+        frame_index : int            – frame counter (forwarded from SmoothedResult)
         ts          : float | None   – Unix timestamp; defaults to time.time()
 
         Returns
         -------
-        int  – rowid of the inserted row
+        int  – row id of the inserted record (useful for testing / tracing)
 
         Raises
         ------
-        DatabaseNotConnectedError  if connect() has not been called.
-        DatabaseError              on SQLite write failure.
+        DatabaseNotOpenError  if open() has not been called.
+        DatabaseError         on any SQLite write failure.
         """
-        self._require_connected()
-        self._validate_decision(decision, frame_index)
+        self._require_open("log_decision")
+        self._validate_decision(decision)
 
-        ts = ts if ts is not None else time.time()
-        raw_duration_db = (
-            None if (decision.raw_duration is None or
-                     not math.isfinite(decision.raw_duration))
-            else decision.raw_duration
-        )
-
-        sql = """
-            INSERT INTO decisions
-                (ts, frame_index, lane_id, vehicle_count, green_duration,
-                 raw_duration, algorithm, was_clamped, clamp_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        params = (
-            ts,
-            frame_index,
-            decision.lane_id,
-            decision.vehicle_count,
-            decision.green_duration,
-            raw_duration_db,
-            decision.algorithm.value,
-            int(decision.was_clamped),
-            decision.clamp_reason,
-        )
-
-        with self._lock:
-            try:
-                cursor = self._conn.execute(sql, params)
-                self._conn.commit()
-                rowid = cursor.lastrowid
-                log.debug(
-                    "Inserted decision rowid=%d lane=%s green=%.1fs frame=%d",
-                    rowid, decision.lane_id, decision.green_duration, frame_index,
-                )
-                return rowid
-            except sqlite3.Error as exc:
-                raise DatabaseError(f"Insert failed: {exc}") from exc
-
-    def insert_frame(
-        self,
-        decisions:   list[PhaseDecision],
-        frame_index: int,
-        ts:          Optional[float] = None,
-    ) -> list[int]:
-        """
-        Insert multiple PhaseDecisions for the same frame atomically.
-
-        All decisions share the same timestamp. On any failure the entire
-        frame is rolled back — no partial writes.
-
-        Returns
-        -------
-        list[int]  – rowids in the same order as decisions
-        """
-        self._require_connected()
-        if not decisions:
-            return []
-
-        ts = ts if ts is not None else time.time()
-        sql = """
-            INSERT INTO decisions
-                (ts, frame_index, lane_id, vehicle_count, green_duration,
-                 raw_duration, algorithm, was_clamped, clamp_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-
-        rows = []
-        for d in decisions:
-            self._validate_decision(d, frame_index)
-            raw_db = (
-                None if (d.raw_duration is None or not math.isfinite(d.raw_duration))
-                else d.raw_duration
-            )
-            rows.append((
-                ts, frame_index, d.lane_id, d.vehicle_count, d.green_duration,
-                raw_db, d.algorithm.value, int(d.was_clamped), d.clamp_reason,
-            ))
-
-        with self._lock:
-            try:
-                rowids = []
-                with self._conn:       # context manager → auto commit/rollback
-                    for row in rows:
-                        cur = self._conn.execute(sql, row)
-                        rowids.append(cur.lastrowid)
-                log.debug(
-                    "Inserted frame=%d (%d decisions) rowids=%s",
-                    frame_index, len(decisions), rowids,
-                )
-                return rowids
-            except sqlite3.Error as exc:
-                raise DatabaseError(f"Frame insert failed (rolled back): {exc}") from exc
-
-    # ── Queries ───────────────────────────────────────────────────────────────
-
-    def query_recent(self, limit: int = 100) -> list[DecisionRecord]:
-        """Return the most recent `limit` decisions, newest first."""
-        self._require_connected()
-        sql = "SELECT * FROM decisions ORDER BY ts DESC LIMIT ?"
-        return self._fetch_records(sql, (limit,))
-
-    def query_lane(
-        self,
-        lane_id: str,
-        limit:   int = 500,
-    ) -> list[DecisionRecord]:
-        """Return decisions for a specific lane, newest first."""
-        self._require_connected()
-        sql = "SELECT * FROM decisions WHERE lane_id = ? ORDER BY ts DESC LIMIT ?"
-        return self._fetch_records(sql, (lane_id, limit))
-
-    def query_time_range(
-        self,
-        start_ts: float,
-        end_ts:   float,
-        lane_id:  Optional[str] = None,
-    ) -> list[DecisionRecord]:
-        """
-        Return decisions within [start_ts, end_ts] (Unix timestamps).
-        Optionally filter by lane_id.
-
-        Raises
-        ------
-        DatabaseError  if start_ts > end_ts.
-        """
-        self._require_connected()
-        if start_ts > end_ts:
-            raise DatabaseError(
-                f"start_ts ({start_ts}) must be <= end_ts ({end_ts})."
-            )
-
-        if lane_id is not None:
-            sql = ("SELECT * FROM decisions "
-                   "WHERE ts BETWEEN ? AND ? AND lane_id = ? ORDER BY ts ASC")
-            params = (start_ts, end_ts, lane_id)
-        else:
-            sql = "SELECT * FROM decisions WHERE ts BETWEEN ? AND ? ORDER BY ts ASC"
-            params = (start_ts, end_ts)
-
-        return self._fetch_records(sql, params)
-
-    def lane_summary(self, lane_id: str) -> Optional[LaneSummary]:
-        """
-        Aggregate stats for one lane — used to generate PFE report graphs.
-        Returns None if the lane has no recorded decisions.
-        """
-        self._require_connected()
-        sql = """
-            SELECT
-                COUNT(*)                            AS total_decisions,
-                AVG(vehicle_count)                  AS avg_vehicle_count,
-                AVG(green_duration)                 AS avg_green_duration,
-                MAX(green_duration)                 AS max_green_duration,
-                MIN(green_duration)                 AS min_green_duration,
-                SUM(CASE WHEN clamp_reason = 'oversaturated' THEN 1 ELSE 0 END)
-                                                    AS oversaturated_count
-            FROM decisions
-            WHERE lane_id = ?
-        """
-        with self._lock:
-            cur = self._conn.execute(sql, (lane_id,))
-            row = cur.fetchone()
-
-        if row is None or row[0] == 0:
-            return None
-
-        return LaneSummary(
-            lane_id=lane_id,
-            total_decisions=int(row[0]),
-            avg_vehicle_count=float(row[1]),
-            avg_green_duration=float(row[2]),
-            max_green_duration=float(row[3]),
-            min_green_duration=float(row[4]),
-            oversaturated_count=int(row[5]),
-        )
-
-    def all_lane_ids(self) -> list[str]:
-        """Return all distinct lane IDs that have been logged."""
-        self._require_connected()
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT DISTINCT lane_id FROM decisions ORDER BY lane_id"
-            )
-            return [row[0] for row in cur.fetchall()]
-
-    def count_decisions(self) -> int:
-        """Total number of rows in the decisions table."""
-        self._require_connected()
-        with self._lock:
-            cur = self._conn.execute("SELECT COUNT(*) FROM decisions")
-            return cur.fetchone()[0]
-
-    # ── Private ───────────────────────────────────────────────────────────────
-
-    def _init_schema(self) -> None:
-        """Create tables if they don't exist and stamp the schema version."""
-        with self._lock:
-            self._conn.executescript("""
-                CREATE TABLE IF NOT EXISTS decisions (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts              REAL    NOT NULL,
-                    frame_index     INTEGER NOT NULL,
-                    lane_id         TEXT    NOT NULL,
-                    vehicle_count   INTEGER NOT NULL,
-                    green_duration  REAL    NOT NULL,
-                    raw_duration    REAL,
-                    algorithm       TEXT    NOT NULL,
-                    was_clamped     INTEGER NOT NULL,
-                    clamp_reason    TEXT    NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_lane_ts
-                    ON decisions(lane_id, ts);
-                CREATE INDEX IF NOT EXISTS idx_ts
-                    ON decisions(ts);
-                CREATE TABLE IF NOT EXISTS schema_version (
-                    version INTEGER PRIMARY KEY
-                );
-                INSERT OR IGNORE INTO schema_version (version) VALUES (1);
-            """)
-            self._conn.commit()
-        log.debug("Schema initialised (version=%d).", SCHEMA_VERSION)
-
-    def _require_connected(self) -> None:
-        if not self._connected or self._conn is None:
-            raise DatabaseNotConnectedError(
-                "Database is not connected. Call db.connect() before using it."
-            )
-
-    def _fetch_records(
-        self, sql: str, params: tuple
-    ) -> list[DecisionRecord]:
-        """Execute a SELECT and return typed DecisionRecord objects."""
-        with self._lock:
-            cur = self._conn.execute(sql, params)
-            rows = cur.fetchall()
-        return [self._row_to_record(r) for r in rows]
-
-    @staticmethod
-    def _row_to_record(row: tuple) -> DecisionRecord:
-        """Map a raw SQLite row tuple to a DecisionRecord dataclass."""
-        (id_, ts, frame_index, lane_id, vehicle_count, green_duration,
-         raw_duration, algorithm, was_clamped, clamp_reason) = row
-        return DecisionRecord(
-            id=int(id_),
-            ts=float(ts),
-            frame_index=int(frame_index),
-            lane_id=str(lane_id),
-            vehicle_count=int(vehicle_count),
-            green_duration=float(green_duration),
-            raw_duration=float(raw_duration) if raw_duration is not None else None,
-            algorithm=str(algorithm),
-            was_clamped=bool(was_clamped),
-            clamp_reason=str(clamp_reason),
-        )
-
-    @staticmethod
-    def _validate_decision(decision: object, frame_index: object) -> None:
-        if not isinstance(decision, PhaseDecision):
-            raise DatabaseError(
-                f"Expected PhaseDecision, got {type(decision).__name__}."
-            )
         if not isinstance(frame_index, int) or frame_index < 0:
             raise DatabaseError(
                 f"frame_index must be a non-negative int, got {frame_index!r}."
             )
+
+        timestamp = ts if ts is not None else time.time()
+
+        # Serialise raw_duration — store inf as a sentinel (-1.0)
+        raw = decision.raw_duration
+        raw_stored = -1.0 if (math.isinf(raw) or math.isnan(raw)) else float(raw)
+
+        row = (
+            timestamp,
+            decision.lane_id,
+            decision.vehicle_count,
+            decision.green_duration,
+            raw_stored,
+            decision.algorithm.value,
+            int(decision.was_clamped),
+            decision.clamp_reason,
+            frame_index,
+        )
+
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO events
+                        (ts, lane_id, vehicle_count, green_duration,
+                         raw_duration, algorithm, was_clamped, clamp_reason,
+                         frame_index)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    row,
+                )
+                self._conn.commit()
+                row_id = cur.lastrowid
+                log.debug(
+                    "Logged decision: lane=%s count=%d green=%.1fs (row %d)",
+                    decision.lane_id, decision.vehicle_count,
+                    decision.green_duration, row_id,
+                )
+                return row_id
+
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"Failed to write event: {exc}") from exc
+
+    # ── Read ──────────────────────────────────────────────────────────────────
+
+    def fetch_recent(self, limit: int = 100) -> list[EventRecord]:
+        """
+        Return the most recent `limit` events, newest first.
+
+        Returns an empty list if the table is empty (never raises on empty).
+
+        Raises
+        ------
+        DatabaseNotOpenError  if open() has not been called.
+        DatabaseError         on SQLite read failure.
+        """
+        self._require_open("fetch_recent")
+
+        if not isinstance(limit, int) or limit < 1:
+            raise DatabaseError(f"limit must be a positive int, got {limit!r}.")
+
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,)
+                )
+                rows = cur.fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"Failed to fetch events: {exc}") from exc
+
+    def fetch_by_lane(self, lane_id: str, limit: int = 100) -> list[EventRecord]:
+        """
+        Return the most recent events for a specific lane, newest first.
+
+        Raises
+        ------
+        DatabaseNotOpenError  if open() has not been called.
+        DatabaseError         on SQLite read failure.
+        """
+        self._require_open("fetch_by_lane")
+
+        if not isinstance(lane_id, str) or not lane_id:
+            raise DatabaseError("lane_id must be a non-empty string.")
+
+        if not isinstance(limit, int) or limit < 1:
+            raise DatabaseError(f"limit must be a positive int, got {limit!r}.")
+
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT * FROM events WHERE lane_id = ? ORDER BY ts DESC LIMIT ?",
+                    (lane_id, limit),
+                )
+                rows = cur.fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"Failed to fetch events for lane '{lane_id}': {exc}") from exc
+
+    def count_events(self) -> int:
+        """Return total number of logged events."""
+        self._require_open("count_events")
+        with self._lock:
+            cur = self._conn.execute("SELECT COUNT(*) FROM events")
+            return cur.fetchone()[0]
+
+    def fetch_lane_summary(self) -> dict[str, dict]:
+        """
+        Return aggregate stats per lane — useful for PFE report graphs.
+
+        Returns
+        -------
+        dict[lane_id, {count: int, avg_vehicles: float, avg_green: float}]
+        """
+        self._require_open("fetch_lane_summary")
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    """
+                    SELECT
+                        lane_id,
+                        COUNT(*)            AS event_count,
+                        AVG(vehicle_count)  AS avg_vehicles,
+                        AVG(green_duration) AS avg_green
+                    FROM events
+                    GROUP BY lane_id
+                    """
+                )
+                rows = cur.fetchall()
+            return {
+                r["lane_id"]: {
+                    "event_count":  r["event_count"],
+                    "avg_vehicles": r["avg_vehicles"],
+                    "avg_green":    r["avg_green"],
+                }
+                for r in rows
+            }
+        except sqlite3.DatabaseError as exc:
+            raise DatabaseError(f"Failed to fetch lane summary: {exc}") from exc
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _require_open(self, method: str) -> None:
+        if not self._is_open:
+            raise DatabaseNotOpenError(
+                f"Database.{method}() called before open(). "
+                "Call db.open() at startup."
+            )
+
+    @staticmethod
+    def _validate_decision(decision: object) -> None:
+        if decision is None:
+            raise DatabaseError("PhaseDecision is None.")
+        if not isinstance(decision, PhaseDecision):
+            raise DatabaseError(
+                f"Expected PhaseDecision, got {type(decision).__name__}."
+            )
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> EventRecord:
+        return EventRecord(
+            id=             row["id"],
+            ts=             row["ts"],
+            lane_id=        row["lane_id"],
+            vehicle_count=  row["vehicle_count"],
+            green_duration= row["green_duration"],
+            raw_duration=   row["raw_duration"],
+            algorithm=      row["algorithm"],
+            was_clamped=    bool(row["was_clamped"]),
+            clamp_reason=   row["clamp_reason"],
+            frame_index=    row["frame_index"],
+        )

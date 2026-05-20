@@ -1,0 +1,30 @@
+# =============================================================================
+# ATCS - Adaptive Traffic Control System
+# server/requirements_server.txt | Laptop / PC (Server node) dependencies
+#
+# Install with:
+#   pip install -r requirements_server.txt
+#
+# Rules:
+#   - NO gpiozero, NO lgpio, NO RPi.GPIO — no GPIO on the server.
+#   - opencv-python (full build) — server has a display, no headless needed.
+#   - paho-mqtt >= 2.0 — must match edge side (API changed from 1.x).
+#   - ultralytics pins a minimum torch version transitively; let it resolve.
+#   - PyYAML for config.yaml parsing (shared/config_loader.py).
+#   - numpy version constrained to stay compatible with ultralytics + opencv.
+# =============================================================================
+
+# YOLOv8s inference engine (pulls in torch + torchvision transitively)
+ultralytics>=8.2.0
+
+# Computer vision — preprocessing, CLAHE, letterbox resize, bilateral filter
+opencv-python>=4.9.0
+
+# Numerical arrays — frame buffers, bbox coordinates
+numpy>=1.26.0,<2.0.0
+
+# MQTT client — Paho 2.x API (must match edge/requirements_edge.txt)
+paho-mqtt>=2.0.0
+
+# Config file parsing (shared/config_loader.py)
+PyYAML>=6.0.1

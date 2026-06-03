@@ -2,30 +2,33 @@
 server/logic/timing_algo.py
 ─────────────────────────────────────────────────────────────────────────────
 Responsibility : Translate stable per-lane vehicle counts (from smoother.py)
-                 into green phase durations that get sent back to the Pi.
+                 into green phase durations, then expose a conversion method
+                 to the shared wire format (shared.schemas.PhaseDecision)
+                 for the MQTT layer.
+
+Two types live here
+    GreenDecision  – internal computation result (pure logic, no wire concerns)
+    TimingResult   – wraps a list of GreenDecision + diagnostics
+
+Wire conversion
+    GreenDecision.to_wire_decision(intersection_id, sequence)
+        → shared.schemas.PhaseDecision   (ready for ServerMQTTClient)
+    TimingResult.to_wire_decisions(intersection_id, sequence)
+        → list[shared.schemas.PhaseDecision]  (convenience wrapper for main.py)
 
 Algorithms
+    LINEAR   – green = clamp(count / vehicles_per_second, min, max)
+               Matches the formula documented in config.yaml.
+               Default algorithm.
+
     WEBSTER  – Classic Webster (1958) optimal cycle formula.
                Best for near-saturated intersections with predictable flow.
                Degrades gracefully to max_green on oversaturation (Y ≥ 1).
 
-    LINEAR   – Simple linear interpolation between min_green and max_green.
-               Proportional to count / saturation_count.
-               Robust, predictable, good for low-traffic deployments.
-
-Safety contract (from spec / PDF)
+Safety contract
     - Every output is clamped to [min_green, max_green].
-    - Default min = 10 s, max = 60 s.
-    - Oversaturation (Y ≥ 1) → max_green + warning log (never a crash).
-
-Output contract (to mqtt_handler / main.py)
-    list[PhaseDecision]  — one per lane in the SmoothedResult
-
-Webster parameters
-    saturation_flow  : vehicles/second that can pass through when green
-                       (default 0.5 veh/s ≈ 1800 veh/h — standard urban value)
-    lost_time        : seconds lost per phase to start-up + clearance
-                       (default 2.0 s — standard single-phase assumption)
+    - Hard safety floors come from shared/constants.py.
+    - Oversaturation (Y ≥ 1) in Webster → max_green + warning (never a crash).
 
 Author : Oussama (server side)
 """
@@ -34,7 +37,8 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
@@ -42,15 +46,17 @@ from server.logic.smoother import SmoothedResult
 
 log = logging.getLogger(__name__)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# Constants / defaults
+# Constants / defaults  (real values come from ATCSConfig at runtime)
 # ──────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_MIN_GREEN: float     = 10.0   # seconds (spec)
-DEFAULT_MAX_GREEN: float     = 60.0   # seconds (spec)
-DEFAULT_SAT_FLOW:  float     = 0.5    # vehicles / second (≈ 1800 veh/h)
-DEFAULT_LOST_TIME: float     = 2.0    # seconds / phase
-OVERSATURATION_THRESHOLD: float = 0.95  # warn before Y hits 1.0
+DEFAULT_MIN_GREEN:        float = 10.0   # seconds
+DEFAULT_MAX_GREEN:        float = 60.0   # seconds
+DEFAULT_VEHICLES_PER_SEC: float = 2.0    # config.yaml: vehicles_per_second
+DEFAULT_SAT_FLOW:         float = 0.5    # veh/s — Webster only (≈ 1800 veh/h)
+DEFAULT_LOST_TIME:        float = 2.0    # seconds/phase — Webster only
+OVERSATURATION_THRESHOLD: float = 0.95   # warn before Y hits 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -62,24 +68,27 @@ class TimingError(ValueError):
 
 
 class Algorithm(str, Enum):
-    WEBSTER = "webster"
-    LINEAR  = "linear"
+    LINEAR  = "linear"    # config.yaml formula: green = count / vehicles_per_second
+    WEBSTER = "webster"   # Webster (1958) optimal cycle
 
 
 @dataclass(frozen=True)
-class PhaseDecision:
+class GreenDecision:
     """
-    Green phase duration decision for one lane.
+    Internal computation result for one lane's green phase duration.
+
+    This is NOT the wire format. Call to_wire_decision() to get the
+    shared.schemas.PhaseDecision object that ServerMQTTClient publishes.
 
     Attributes
     ----------
-    lane_id        : str    – lane this decision applies to
-    green_duration : float  – final clamped green time in seconds
-    raw_duration   : float  – computed duration before safety clamping
-    vehicle_count  : int    – smoothed count that drove this decision
+    lane_id        : str       – lane this decision applies to
+    green_duration : float     – final clamped green time in seconds
+    raw_duration   : float     – computed duration before safety clamping
+    vehicle_count  : int       – smoothed count that drove this decision
     algorithm      : Algorithm – which formula was used
-    was_clamped    : bool   – True if raw_duration != green_duration
-    clamp_reason   : str    – 'min', 'max', 'oversaturated', or ''
+    was_clamped    : bool      – True if raw_duration != green_duration
+    clamp_reason   : str       – 'min', 'max', 'oversaturated', or ''
     """
     lane_id:        str
     green_duration: float
@@ -89,6 +98,42 @@ class PhaseDecision:
     was_clamped:    bool
     clamp_reason:   str = ""
 
+    def to_wire_decision(
+        self,
+        intersection_id: str,
+        sequence:        int = 0,
+    ):
+        """
+        Convert this GreenDecision to the shared wire format.
+
+        Imports are lazy so timing_algo.py stays importable without the
+        shared package (useful in isolated unit tests).
+
+        Parameters
+        ----------
+        intersection_id : str
+            ATCSConfig.intersection.id — must match the Pi's config exactly.
+        sequence : int
+            FramePayload.sequence that triggered this decision.
+            Enables end-to-end latency tracing.
+
+        Returns
+        -------
+        shared.schemas.PhaseDecision
+            Ready for ServerMQTTClient.publish_decision().
+        """
+        from shared.schemas import PhaseDecision as WireDecision  # type: ignore
+        from shared.constants import Phase                         # type: ignore
+
+        return WireDecision(
+            intersection_id  = intersection_id,
+            phase            = Phase.GREEN,
+            duration_seconds = self.green_duration,
+            vehicle_count    = self.vehicle_count,
+            timestamp        = time.time(),
+            sequence         = sequence,
+        )
+
 
 @dataclass
 class TimingResult:
@@ -97,20 +142,44 @@ class TimingResult:
 
     Attributes
     ----------
-    decisions      : list[PhaseDecision]  – one per lane
-    cycle_length   : float  – total cycle length in seconds (sum of all greens
-                              + lost times); informational only
-    any_oversaturated : bool – True if at least one lane hit oversaturation
-    frame_index    : int    – forwarded from SmoothedResult for traceability
+    decisions         : list[GreenDecision] – one per lane
+    cycle_length      : float  – sum of greens + lost times (informational)
+    any_oversaturated : bool   – True if at least one lane hit oversaturation
+    frame_index       : int    – forwarded from SmoothedResult for traceability
     """
-    decisions:          list[PhaseDecision]
+    decisions:          list[GreenDecision]
     cycle_length:       float
     any_oversaturated:  bool
     frame_index:        int
 
-    def for_lane(self, lane_id: str) -> Optional[PhaseDecision]:
-        """Return the PhaseDecision for a specific lane, or None if not found."""
+    def for_lane(self, lane_id: str) -> Optional[GreenDecision]:
+        """Return the GreenDecision for a specific lane, or None if not found."""
         return next((d for d in self.decisions if d.lane_id == lane_id), None)
+
+    def to_wire_decisions(
+        self,
+        intersection_id: str,
+        sequence:        int = 0,
+    ) -> list:
+        """
+        Convert all GreenDecisions to shared.schemas.PhaseDecision objects.
+
+        Convenience wrapper used by main.py:
+            wires = timing.to_wire_decisions(cfg.intersection.id, frame.sequence)
+            for d in wires:
+                mqtt_client.publish_decision(d)
+
+        Returns
+        -------
+        list[shared.schemas.PhaseDecision]
+        """
+        return [
+            d.to_wire_decision(
+                intersection_id = intersection_id,
+                sequence        = sequence,
+            )
+            for d in self.decisions
+        ]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,44 +192,56 @@ class TimingAlgo:
 
     Usage
     -----
-        algo = TimingAlgo(algorithm=Algorithm.WEBSTER)
+        algo   = TimingAlgo(
+                     algorithm        = Algorithm.LINEAR,
+                     min_green        = cfg.server.min_green_duration,
+                     max_green        = cfg.server.max_green_duration,
+                     vehicles_per_sec = cfg.server.vehicles_per_second,
+                 )
         result = algo.compute(smoothed_result)
+        wires  = result.to_wire_decisions(cfg.intersection.id, frame.sequence)
     """
 
     def __init__(
         self,
-        algorithm:   Algorithm = Algorithm.WEBSTER,
-        min_green:   float = DEFAULT_MIN_GREEN,
-        max_green:   float = DEFAULT_MAX_GREEN,
-        sat_flow:    float = DEFAULT_SAT_FLOW,
-        lost_time:   float = DEFAULT_LOST_TIME,
+        algorithm:        Algorithm = Algorithm.LINEAR,
+        min_green:        float = DEFAULT_MIN_GREEN,
+        max_green:        float = DEFAULT_MAX_GREEN,
+        vehicles_per_sec: float = DEFAULT_VEHICLES_PER_SEC,
+        sat_flow:         float = DEFAULT_SAT_FLOW,
+        lost_time:        float = DEFAULT_LOST_TIME,
     ) -> None:
         """
         Parameters
         ----------
-        algorithm  : Algorithm  – WEBSTER or LINEAR
-        min_green  : float      – minimum green duration in seconds (>= 1)
-        max_green  : float      – maximum green duration in seconds
-        sat_flow   : float      – saturation flow in vehicles/second (> 0)
-        lost_time  : float      – lost time per phase in seconds (>= 0)
+        algorithm        : Algorithm – LINEAR (default) or WEBSTER
+        min_green        : float     – minimum green duration in seconds
+        max_green        : float     – maximum green duration in seconds
+        vehicles_per_sec : float     – LINEAR: vehicles discharged per second
+                                       of green (from config.yaml)
+        sat_flow         : float     – WEBSTER only: saturation flow (veh/s)
+        lost_time        : float     – WEBSTER only: lost time per phase (s)
 
         Raises
         ------
-        TimingError  on any invalid configuration value.
+        TimingError on any invalid configuration value.
         """
-        self._validate_config(algorithm, min_green, max_green, sat_flow, lost_time)
+        self._validate_config(
+            algorithm, min_green, max_green, vehicles_per_sec, sat_flow, lost_time
+        )
 
-        self._algorithm  = Algorithm(algorithm)
-        self._min_green  = float(min_green)
-        self._max_green  = float(max_green)
-        self._sat_flow   = float(sat_flow)
-        self._lost_time  = float(lost_time)
+        self._algorithm        = Algorithm(algorithm)
+        self._min_green        = float(min_green)
+        self._max_green        = float(max_green)
+        self._vehicles_per_sec = float(vehicles_per_sec)
+        self._sat_flow         = float(sat_flow)
+        self._lost_time        = float(lost_time)
 
         log.info(
             "TimingAlgo ready | algo=%s | green=[%.1fs, %.1fs] | "
-            "sat_flow=%.2f veh/s | lost_time=%.1fs",
+            "veh/s=%.2f | sat_flow=%.2f | lost_time=%.1fs",
             self._algorithm.value, self._min_green, self._max_green,
-            self._sat_flow, self._lost_time,
+            self._vehicles_per_sec, self._sat_flow, self._lost_time,
         )
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -177,7 +258,7 @@ class TimingAlgo:
         Returns
         -------
         TimingResult
-            Per-lane PhaseDecisions + aggregate diagnostics.
+            Per-lane GreenDecisions + aggregate diagnostics.
 
         Raises
         ------
@@ -186,7 +267,7 @@ class TimingAlgo:
         """
         self._validate_input(smoothed)
 
-        decisions: list[PhaseDecision] = []
+        decisions:        list[GreenDecision] = []
         any_oversaturated = False
 
         for lane_id, count in smoothed.counts.items():
@@ -208,10 +289,10 @@ class TimingAlgo:
         )
 
         return TimingResult(
-            decisions=decisions,
-            cycle_length=cycle_length,
-            any_oversaturated=any_oversaturated,
-            frame_index=smoothed.frame_index,
+            decisions         = decisions,
+            cycle_length      = cycle_length,
+            any_oversaturated = any_oversaturated,
+            frame_index       = smoothed.frame_index,
         )
 
     @property
@@ -228,54 +309,59 @@ class TimingAlgo:
 
     # ── Private: dispatch ──────────────────────────────────────────────────────
 
-    def _decide(self, lane_id: str, count: int) -> tuple[PhaseDecision, bool]:
-        """
-        Compute a PhaseDecision for one lane.
-        Returns (decision, oversaturated_flag).
-        """
+    def _decide(self, lane_id: str, count: int) -> tuple[GreenDecision, bool]:
         if self._algorithm == Algorithm.WEBSTER:
             return self._webster(lane_id, count)
-        else:
-            return self._linear(lane_id, count)
+        return self._linear(lane_id, count)
+
+    # ── Linear formula ─────────────────────────────────────────────────────────
+
+    def _linear(self, lane_id: str, count: int) -> tuple[GreenDecision, bool]:
+        """
+        green = clamp(count / vehicles_per_second, min_green, max_green)
+
+        Implements config.yaml spec:
+            vehicles_per_second: 2  →  green = count / 2
+        """
+        raw = (
+            count / self._vehicles_per_sec
+            if self._vehicles_per_sec > 0
+            else 0.0
+        )
+        return self._clamped_decision(
+            lane_id, raw=raw, count=count, algo=Algorithm.LINEAR
+        ), False
 
     # ── Webster formula ────────────────────────────────────────────────────────
 
-    def _webster(self, lane_id: str, count: int) -> tuple[PhaseDecision, bool]:
+    def _webster(self, lane_id: str, count: int) -> tuple[GreenDecision, bool]:
         """
         Webster (1958) optimal green time for a single phase.
-
-        Flow ratio y = count / saturation_flow
-        Optimal cycle C = (1.5L + 5) / (1 - Y)   where Y = y (single phase)
-        Green time g = (C - L) * y / Y            simplifies to (C - L) when Y=y
-
-        For a single-phase approach (one lane at a time):
+            y = count / sat_flow
+            C = (1.5L + 5) / (1 - Y)
             g = C - L
-
         On oversaturation (Y >= 1.0): fall back to max_green.
         """
         oversaturated = False
-        y = count / self._sat_flow   # flow ratio for this lane
-        Y = y                        # single-phase: Y = y
+        Y = count / self._sat_flow
 
-        # Guard: oversaturation
         if Y >= 1.0:
             log.warning(
-                "Lane '%s' is oversaturated (Y=%.3f >= 1.0, count=%d). "
+                "Lane '%s' oversaturated (Y=%.3f >= 1.0, count=%d). "
                 "Falling back to max_green=%.1fs.",
                 lane_id, Y, count, self._max_green,
             )
             oversaturated = True
-            return PhaseDecision(
-                lane_id=lane_id,
-                green_duration=self._max_green,
-                raw_duration=float("inf"),
-                vehicle_count=count,
-                algorithm=Algorithm.WEBSTER,
-                was_clamped=True,
-                clamp_reason="oversaturated",
+            return GreenDecision(
+                lane_id        = lane_id,
+                green_duration = self._max_green,
+                raw_duration   = float("inf"),
+                vehicle_count  = count,
+                algorithm      = Algorithm.WEBSTER,
+                was_clamped    = True,
+                clamp_reason   = "oversaturated",
             ), oversaturated
 
-        # Warn when approaching saturation
         if Y >= OVERSATURATION_THRESHOLD:
             log.warning(
                 "Lane '%s' approaching saturation (Y=%.3f). "
@@ -283,76 +369,56 @@ class TimingAlgo:
                 lane_id, Y,
             )
 
-        # Zero traffic → minimum green (avoids C = (1.5L+5)/1 but g → 0)
         if count == 0:
             return self._clamped_decision(
                 lane_id, raw=0.0, count=0, algo=Algorithm.WEBSTER
             ), oversaturated
 
         L = self._lost_time
-        C = (1.5 * L + 5.0) / (1.0 - Y)   # optimal cycle length
-        g = C - L                            # effective green (single-phase)
-
-        return self._clamped_decision(lane_id, raw=g, count=count, algo=Algorithm.WEBSTER), oversaturated
-
-    # ── Linear formula ─────────────────────────────────────────────────────────
-
-    def _linear(self, lane_id: str, count: int) -> tuple[PhaseDecision, bool]:
-        """
-        Linear interpolation:
-            g = min_green + (count / sat_count) * (max_green - min_green)
-
-        where sat_count = sat_flow * max_green (vehicles that fill the max window).
-        Clamped to [min_green, max_green].
-        """
-        sat_count = self._sat_flow * self._max_green
-        ratio = min(count / sat_count, 1.0) if sat_count > 0 else 0.0
-        g = self._min_green + ratio * (self._max_green - self._min_green)
-        return self._clamped_decision(lane_id, raw=g, count=count, algo=Algorithm.LINEAR), False
+        C = (1.5 * L + 5.0) / (1.0 - Y)
+        g = C - L
+        return self._clamped_decision(
+            lane_id, raw=g, count=count, algo=Algorithm.WEBSTER
+        ), oversaturated
 
     # ── Clamping helper ────────────────────────────────────────────────────────
 
     def _clamped_decision(
         self,
         lane_id: str,
-        raw: float,
-        count: int,
-        algo: Algorithm,
-    ) -> PhaseDecision:
-        """Apply [min_green, max_green] safety clamp and build PhaseDecision."""
+        raw:     float,
+        count:   int,
+        algo:    Algorithm,
+    ) -> GreenDecision:
+        """Apply [min_green, max_green] safety clamp and return a GreenDecision."""
         if math.isnan(raw) or math.isinf(raw):
             log.warning(
-                "Lane '%s': raw duration is %s — clamping to max_green.", lane_id, raw
+                "Lane '%s': raw duration is non-finite (%s) — clamping to max_green.",
+                lane_id, raw,
             )
-            clamped = self._max_green
-            reason = "max"
+            clamped, reason = self._max_green, "max"
         elif raw < self._min_green:
-            clamped = self._min_green
-            reason = "min"
+            clamped, reason = self._min_green, "min"
         elif raw > self._max_green:
-            clamped = self._max_green
-            reason = "max"
+            clamped, reason = self._max_green, "max"
         else:
-            clamped = raw
-            reason = ""
+            clamped, reason = raw, ""
 
-        was_clamped = clamped != raw
-
-        return PhaseDecision(
-            lane_id=lane_id,
-            green_duration=round(clamped, 2),
-            raw_duration=round(raw, 4) if math.isfinite(raw) else raw,
-            vehicle_count=count,
-            algorithm=algo,
-            was_clamped=was_clamped,
-            clamp_reason=reason,
+        return GreenDecision(
+            lane_id        = lane_id,
+            green_duration = round(clamped, 2),
+            raw_duration   = round(raw, 4) if math.isfinite(raw) else raw,
+            vehicle_count  = count,
+            algorithm      = algo,
+            was_clamped    = clamped != raw,
+            clamp_reason   = reason,
         )
 
     # ── Validation ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _validate_config(
-        algorithm, min_green, max_green, sat_flow, lost_time
+        algorithm, min_green, max_green, vehicles_per_sec, sat_flow, lost_time
     ) -> None:
         try:
             Algorithm(algorithm)
@@ -363,13 +429,16 @@ class TimingAlgo:
             )
 
         for name, val, minimum in [
-            ("min_green",  min_green,  1.0),
-            ("max_green",  max_green,  1.0),
-            ("sat_flow",   sat_flow,   1e-6),
-            ("lost_time",  lost_time,  0.0),
+            ("min_green",        min_green,        1.0),
+            ("max_green",        max_green,        1.0),
+            ("vehicles_per_sec", vehicles_per_sec, 1e-6),
+            ("sat_flow",         sat_flow,         1e-6),
+            ("lost_time",        lost_time,        0.0),
         ]:
             if not isinstance(val, (int, float)) or isinstance(val, bool):
-                raise TimingError(f"{name} must be a number, got {type(val).__name__}.")
+                raise TimingError(
+                    f"{name} must be a number, got {type(val).__name__}."
+                )
             if not math.isfinite(val):
                 raise TimingError(f"{name} must be finite, got {val}.")
             if val < minimum:

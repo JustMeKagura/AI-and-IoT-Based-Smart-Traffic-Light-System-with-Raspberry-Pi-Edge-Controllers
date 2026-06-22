@@ -103,11 +103,10 @@ class ServerMQTTClient:
         self._client.on_message    = self._on_message
         self._client.on_publish    = self._on_publish
 
-        if self._cfg.username:
-            self._client.username_pw_set(
-                self._cfg.username,
-                self._cfg.password,
-            )
+        # No broker authentication for this deployment — MQTTConfig has no
+        # username/password fields (local broker, no auth configured in
+        # config.yaml). Matches edge/network/mqtt_client.py, which also
+        # connects without auth.
 
     # ──────────────────────────────────────────────────────────────────────────
     # Lifecycle

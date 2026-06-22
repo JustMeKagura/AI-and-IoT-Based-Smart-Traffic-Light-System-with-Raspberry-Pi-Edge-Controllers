@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from constants import Phase
+from shared.constants import Phase
 
 
 # -----------------------------------------------------------------------------

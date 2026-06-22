@@ -24,7 +24,7 @@ from typing import List, Tuple
 
 import yaml
 
-from constants import (
+from shared.constants import (
     SAFETY_MIN_GREEN_SECONDS,
     SAFETY_MAX_GREEN_SECONDS,
     SAFETY_MIN_AMBER_SECONDS,

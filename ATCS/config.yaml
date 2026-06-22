@@ -20,8 +20,10 @@ mqtt:
 # 2. INTERSECTION
 # -----------------------------------------------------------------------------
 intersection:
-  id: "intersection_01"               # Used to build all MQTT topic strings
+  id: "intersection_rue_mekka_laayoune"  # Used to build all MQTT topic strings
                                       # Topic pattern: atcs/{id}/...
+  display_name: "Intersection_Rue_Mekka_Laayoune"  # Human-readable label
+                                      # (for DB/UI display, not used in topics)
 
 # -----------------------------------------------------------------------------
 # 3. EDGE (Raspberry Pi) SETTINGS
@@ -80,6 +82,16 @@ server:
 
   # SQLite Persistence
   db_path: "atcs_log.db"             # Path to SQLite database file
+
+# -----------------------------------------------------------------------------
+# 4b. LANES
+# -----------------------------------------------------------------------------
+# Pixel-space rectangles (x1, y1, x2, y2) on the 640x640 preprocessed frame,
+# used by server/inference/counter.py to assign detections to a lane.
+# Architecture supports any number of lanes/intersections — for the defense
+# demo we run a single lane covering the full frame.
+lanes:
+  Lane_Boulevard_El_Kairaouane: [0, 0, 640, 640]
 
 # -----------------------------------------------------------------------------
 # 5. LOGGING

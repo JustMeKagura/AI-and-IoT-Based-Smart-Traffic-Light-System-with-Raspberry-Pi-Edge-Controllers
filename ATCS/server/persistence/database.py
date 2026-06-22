@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from server.logic.timing_algo import PhaseDecision
+from server.logic.timing_algo import GreenDecision
 
 log = logging.getLogger(__name__)
 
@@ -183,16 +183,16 @@ class Database:
 
     def log_decision(
         self,
-        decision:    PhaseDecision,
+        decision:    GreenDecision,
         frame_index: int = 0,
         ts:          Optional[float] = None,
     ) -> int:
         """
-        Insert one PhaseDecision into the events table.
+        Insert one GreenDecision into the events table.
 
         Parameters
         ----------
-        decision    : PhaseDecision  – output of timing_algo.compute()
+        decision    : GreenDecision  – output of TimingAlgo.compute() (per-lane)
         frame_index : int            – frame counter (forwarded from SmoothedResult)
         ts          : float | None   – Unix timestamp; defaults to time.time()
 
@@ -366,10 +366,10 @@ class Database:
     @staticmethod
     def _validate_decision(decision: object) -> None:
         if decision is None:
-            raise DatabaseError("PhaseDecision is None.")
-        if not isinstance(decision, PhaseDecision):
+            raise DatabaseError("GreenDecision is None.")
+        if not isinstance(decision, GreenDecision):
             raise DatabaseError(
-                f"Expected PhaseDecision, got {type(decision).__name__}."
+                f"Expected GreenDecision, got {type(decision).__name__}."
             )
 
     @staticmethod
